@@ -1,0 +1,12 @@
+# API
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Dados e imagem
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Reconhecimento facial (InsightFace / ArcFace 512d)
+insightface>=0.7.0
+onnxruntime>=1.16.0
