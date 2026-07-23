@@ -1,56 +1,58 @@
 # Instalação – Reconhecimento Facial API
 
-O pacote `face_recognition` depende do **dlib**, que normalmente exige **CMake** para compilar. No **macOS (Apple Silicon)** dá para usar wheel pré-compilado e evitar CMake.
+API FastAPI + **InsightFace** (`buffalo_l` / ArcFace 512d) com **onnxruntime**.
+Não usa mais `face_recognition` / dlib.
 
 ---
 
-## macOS (Apple Silicon) – sem CMake (recomendado)
+## Requisitos
 
-Use o pacote **dlib-bin** (wheel pré-compilado). Com o venv ativado, na ordem:
-
-```bash
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org dlib-bin
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org face_recognition --no-deps
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org Pillow face-recognition-models
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org "fastapi>=0.109.0" "uvicorn[standard]>=0.27.0" "python-multipart>=0.0.6" "numpy>=1.24.0"
-```
-
-Se não tiver erro de SSL, pode omitir `--trusted-host pypi.org --trusted-host files.pythonhosted.org`.
-
-**Não** rode `pip install -r requirements.txt` depois disso, senão o pip tentará compilar o `dlib` de novo.
+- Python 3.10+
+- ~500 MB de espaço (modelo baixado na primeira execução)
 
 ---
 
-## Linux / Windows ou macOS com CMake
-
-### Erro: "CMake is not installed on your system"
-
-Siga **uma** das opções abaixo.
-
-**Opção A – CMake via Homebrew (macOS)**
-
-Se o Homebrew der erro de permissão, ajuste uma vez:
+## Instalação
 
 ```bash
-sudo chown -R $(whoami) /opt/homebrew /Users/leorodrigues/Library/Logs/Homebrew
-brew install cmake
+cd /Users/leorodrigues/projects/ppgo-biometria
+
+python3 -m venv venv
+source venv/bin/activate   # macOS/Linux
+# venv\Scripts\activate    # Windows
+
 pip install -r requirements.txt
 ```
 
-**Opção B – CMake via pip**
+Se houver erro de SSL no pip:
 
 ```bash
-pip install cmake
-pip install -r requirements.txt
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
 ```
-
-(No build isolado do pip o wrapper do cmake pode falhar; nesse caso use Homebrew.)
 
 ---
 
-### Erro de SSL no pip
+## Variáveis de ambiente (opcional)
 
-Se aparecer `SSLError` ou `OSStatus -26276`:
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `BIOMETRIA_API_KEY` | (vazio) | Se definido, exige header `X-API-Key` |
+| `CORS_ORIGINS` | `*` | Origins permitidos, separados por vírgula |
+| `MAX_UPLOAD_BYTES` | `8388608` (8 MB) | Tamanho máximo do upload |
+| `MIN_FACE_CONFIDENCE` | `0.70` | Confiança mínima da detecção |
+| `MIN_FACE_AREA_RATIO` | `0.05` | Área mínima do rosto vs imagem (5%) |
 
-- Atualizar certificados: **Applications → Python 3.x → Install Certificates.command**
-- Ou use: `pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org <pacote>`
+**Produção:** defina `BIOMETRIA_API_KEY` e `CORS_ORIGINS` com os origins do backend/app.
+
+Exemplo:
+
+```bash
+export BIOMETRIA_API_KEY="sua-chave-secreta"
+export CORS_ORIGINS="https://api.exemplo.gov.br,https://app.exemplo.gov.br"
+```
+
+---
+
+## GPU (opcional)
+
+Por padrão usa CPU (`CPUExecutionProvider`). Com CUDA instalado, altere em `main.py` para `CUDAExecutionProvider` e instale `onnxruntime-gpu`.

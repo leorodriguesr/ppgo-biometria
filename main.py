@@ -4,17 +4,19 @@ Gera embeddings faciais modernos (ArcFace 512 dimensões) sem persistência.
 O backend principal decide quando persistir biometria.
 """
 
+import asyncio
 import io
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageOps
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import insightface
 from insightface.app import FaceAnalysis
 
 
@@ -23,11 +25,33 @@ from insightface.app import FaceAnalysis
 # ==============================
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MB
+MIN_FACE_CONFIDENCE = float(os.getenv("MIN_FACE_CONFIDENCE", "0.70"))
+MIN_FACE_AREA_RATIO = float(os.getenv("MIN_FACE_AREA_RATIO", "0.05"))  # 5% da imagem
+API_KEY = os.getenv("BIOMETRIA_API_KEY", "").strip()
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 ERROR_CODE_NO_FACE = "NO_FACE_DETECTED"
 ERROR_CODE_MULTIPLE_FACES = "MULTIPLE_FACES"
 ERROR_CODE_INVALID_IMAGE = "INVALID_IMAGE"
 ERROR_CODE_INVALID_FILE = "INVALID_FILE"
+ERROR_CODE_LOW_FACE_CONFIDENCE = "LOW_FACE_CONFIDENCE"
+ERROR_CODE_FACE_TOO_SMALL = "FACE_TOO_SMALL"
+ERROR_CODE_UNAUTHORIZED = "UNAUTHORIZED"
+ERROR_CODE_MODEL_NOT_READY = "MODEL_NOT_READY"
+ERROR_CODE_TOO_DARK = "TOO_DARK"
+ERROR_CODE_TOO_BRIGHT = "TOO_BRIGHT"
+
+MIN_BRIGHTNESS = float(os.getenv("MIN_BRIGHTNESS", "45"))   # 0–255
+MAX_BRIGHTNESS = float(os.getenv("MAX_BRIGHTNESS", "220"))  # 0–255
+
+MODEL_NAME = "ArcFace"
+MODEL_VERSION = "buffalo_l"
+EMBEDDING_SIZE = 512
 
 
 # ==============================
@@ -35,17 +59,39 @@ ERROR_CODE_INVALID_FILE = "INVALID_FILE"
 # ==============================
 
 face_app: Optional[FaceAnalysis] = None
+model_ready = False
+
+
+def load_face_app() -> FaceAnalysis:
+    app_instance = FaceAnalysis(
+        name=MODEL_VERSION,
+        providers=["CPUExecutionProvider"],  # Trocar para CUDAExecutionProvider se tiver GPU
+    )
+    app_instance.prepare(ctx_id=0, det_size=(640, 640))
+    return app_instance
 
 
 def get_face_app() -> FaceAnalysis:
-    global face_app
-    if face_app is None:
-        face_app = FaceAnalysis(
-            name="buffalo_l",  # 512 dimensões
-            providers=["CPUExecutionProvider"],  # Trocar para CUDAExecutionProvider se tiver GPU
+    if face_app is None or not model_ready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": ERROR_CODE_MODEL_NOT_READY,
+                "message": "Modelo não pronto",
+                "detail": "O modelo de reconhecimento facial ainda está carregando.",
+            },
         )
-        face_app.prepare(ctx_id=0, det_size=(640, 640))
     return face_app
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global face_app, model_ready
+    face_app = await asyncio.to_thread(load_face_app)
+    model_ready = True
+    yield
+    model_ready = False
+    face_app = None
 
 
 # ==============================
@@ -55,16 +101,35 @@ def get_face_app() -> FaceAnalysis:
 app = FastAPI(
     title="API Reconhecimento Facial",
     description="Geração de embeddings faciais 512d com InsightFace (ArcFace)",
-    version="2.0.0",
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ==============================
+# Auth
+# ==============================
+
+async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    if not API_KEY:
+        return
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": ERROR_CODE_UNAUTHORIZED,
+                "message": "Não autorizado",
+                "detail": "Informe um X-API-Key válido.",
+            },
+        )
 
 
 # ==============================
@@ -81,7 +146,7 @@ def validate_image_upload(file: UploadFile) -> None:
             detail={
                 "code": ERROR_CODE_INVALID_FILE,
                 "message": "Formato de imagem não suportado",
-                "detail": f"Use: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}",
+                "detail": f"Use: {', '.join(sorted(ALLOWED_IMAGE_EXTENSIONS))}",
             },
         )
 
@@ -97,7 +162,7 @@ def validate_image_upload(file: UploadFile) -> None:
 
 
 async def read_image_bytes(file: UploadFile) -> bytes:
-    content = await file.read()
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
     if not content:
         raise HTTPException(
             status_code=400,
@@ -105,6 +170,15 @@ async def read_image_bytes(file: UploadFile) -> bytes:
                 "code": ERROR_CODE_INVALID_FILE,
                 "message": "Arquivo vazio",
                 "detail": "O arquivo enviado está vazio.",
+            },
+        )
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_INVALID_FILE,
+                "message": "Arquivo muito grande",
+                "detail": f"Tamanho máximo permitido: {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
             },
         )
     return content
@@ -128,6 +202,70 @@ def load_image(image_bytes: bytes) -> np.ndarray:
         )
 
 
+def l2_normalize(embedding: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(embedding))
+    if norm == 0.0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_INVALID_IMAGE,
+                "message": "Embedding inválido",
+                "detail": "Não foi possível normalizar o embedding facial.",
+            },
+        )
+    return embedding / norm
+
+
+def face_area_ratio(face, image_shape: tuple[int, ...]) -> float:
+    bbox = getattr(face, "bbox", None)
+    if bbox is None or len(bbox) < 4:
+        return 1.0
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    face_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    image_area = float(image_shape[0] * image_shape[1])
+    if image_area <= 0:
+        return 1.0
+    return face_area / image_area
+
+
+def mean_brightness(img_np: np.ndarray) -> float:
+    """Luminância média aproximada (0–255) em RGB."""
+    # ITU-R BT.601
+    r = img_np[:, :, 0].astype(np.float64)
+    g = img_np[:, :, 1].astype(np.float64)
+    b = img_np[:, :, 2].astype(np.float64)
+    return float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
+
+
+def assert_illumination_ok(img_np: np.ndarray) -> float:
+    brightness = mean_brightness(img_np)
+    if brightness < MIN_BRIGHTNESS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_TOO_DARK,
+                "message": "Imagem muito escura",
+                "detail": (
+                    f"Brilho médio: {brightness:.1f}. "
+                    f"Mínimo: {MIN_BRIGHTNESS:.0f}. Melhore a iluminação."
+                ),
+            },
+        )
+    if brightness > MAX_BRIGHTNESS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_TOO_BRIGHT,
+                "message": "Imagem muito clara / estourada",
+                "detail": (
+                    f"Brilho médio: {brightness:.1f}. "
+                    f"Máximo: {MAX_BRIGHTNESS:.0f}. Reduza a luz ou evite reflexo."
+                ),
+            },
+        )
+    return brightness
+
+
 # ==============================
 # Response Model
 # ==============================
@@ -140,20 +278,32 @@ class GenerateEmbeddingResponse(BaseModel):
     faceConfidence: float
 
 
+class ValidatePhotoQualityResponse(BaseModel):
+    ok: bool
+    brightness: float
+    minBrightness: float
+    maxBrightness: float
+
+
 # ==============================
 # Endpoint principal
 # ==============================
 
-@app.post("/generate-embedding", response_model=GenerateEmbeddingResponse)
+@app.post(
+    "/generate-embedding",
+    response_model=GenerateEmbeddingResponse,
+    dependencies=[Depends(require_api_key)],
+)
 async def generate_embedding(
     file: UploadFile = File(..., description="Imagem do rosto para gerar embedding"),
 ):
     validate_image_upload(file)
     image_bytes = await read_image_bytes(file)
     img_np = load_image(image_bytes)
+    assert_illumination_ok(img_np)
 
-    face_app = get_face_app()
-    faces = face_app.get(img_np)
+    analysis = get_face_app()
+    faces = await asyncio.to_thread(analysis.get, img_np)
 
     if not faces:
         raise HTTPException(
@@ -176,225 +326,77 @@ async def generate_embedding(
         )
 
     face = faces[0]
-
-    embedding = face.embedding  # 512 dimensões
     confidence = float(face.det_score)
+
+    if confidence < MIN_FACE_CONFIDENCE:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_LOW_FACE_CONFIDENCE,
+                "message": "Confiança do rosto abaixo do mínimo",
+                "detail": (
+                    f"Confiança detectada: {confidence:.3f}. "
+                    f"Mínimo exigido: {MIN_FACE_CONFIDENCE:.2f}."
+                ),
+            },
+        )
+
+    ratio = face_area_ratio(face, img_np.shape)
+    if ratio < MIN_FACE_AREA_RATIO:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_FACE_TOO_SMALL,
+                "message": "Rosto muito pequeno na imagem",
+                "detail": (
+                    f"Área do rosto: {ratio:.1%} da imagem. "
+                    f"Mínimo exigido: {MIN_FACE_AREA_RATIO:.0%}."
+                ),
+            },
+        )
+
+    embedding = l2_normalize(np.asarray(face.embedding, dtype=np.float64))
 
     return GenerateEmbeddingResponse(
         embedding=embedding.tolist(),
-        modelName="ArcFace",
-        modelVersion="buffalo_l",
+        modelName=MODEL_NAME,
+        modelVersion=MODEL_VERSION,
         embeddingSize=len(embedding),
         faceConfidence=confidence,
     )
 
 
+@app.post(
+    "/validate-photo-quality",
+    response_model=ValidatePhotoQualityResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def validate_photo_quality(
+    file: UploadFile = File(..., description="Imagem para validar iluminação (sem exigir rosto)"),
+):
+    """Valida só iluminação — útil para fotos de perfil onde a face pode não ser detectada."""
+    validate_image_upload(file)
+    image_bytes = await read_image_bytes(file)
+    img_np = load_image(image_bytes)
+    brightness = assert_illumination_ok(img_np)
+    return ValidatePhotoQualityResponse(
+        ok=True,
+        brightness=brightness,
+        minBrightness=MIN_BRIGHTNESS,
+        maxBrightness=MAX_BRIGHTNESS,
+    )
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "buffalo_l (512d)"}
+    return {
+        "status": "ok" if model_ready else "starting",
+        "model": f"{MODEL_VERSION} ({EMBEDDING_SIZE}d)",
+        "modelReady": model_ready,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-
-
-# """
-# API de Reconhecimento Facial - FastAPI + face_recognition
-# Gera embeddings faciais sem persistência. O backend principal decide quando persistir biometria.
-# """
-
-# import io
-# from pathlib import Path
-
-# import numpy as np
-# from PIL import Image, ImageOps
-# from fastapi import FastAPI, File, HTTPException, UploadFile
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-
-# ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-
-
-# def get_face_lib():
-#     try:
-#         import face_recognition
-#         return face_recognition
-#     except ImportError as e:
-#         raise HTTPException(
-#             status_code=503,
-#             detail="Biblioteca face_recognition não disponível. Instale: pip install face_recognition (requer cmake e dlib)."
-#         ) from e
-
-
-# app = FastAPI(
-#     title="API Reconhecimento Facial",
-#     description="Geração de embeddings faciais com face_recognition (sem persistência)",
-#     version="1.0.0",
-# )
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # Códigos de erro para o frontend tratar
-# ERROR_CODE_NO_FACE = "NO_FACE_DETECTED"
-# ERROR_CODE_INVALID_IMAGE = "INVALID_IMAGE"
-# ERROR_CODE_ENCODING_FAILED = "ENCODING_FAILED"
-# ERROR_CODE_INVALID_FILE = "INVALID_FILE"
-
-
-# def _error_detail(code: str, message: str, detail: str) -> dict:
-#     """Resposta de erro padronizada: code, message (curto), detail (motivo completo)."""
-#     return {"code": code, "message": message, "detail": detail}
-
-
-# def validate_image_upload(file: UploadFile) -> None:
-#     # React Native / Expo às vezes não envia filename; usar fallback
-#     filename = file.filename or "face.jpg"
-#     ext = Path(filename).suffix.lower()
-#     if ext not in ALLOWED_IMAGE_EXTENSIONS:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=_error_detail(
-#                 ERROR_CODE_INVALID_FILE,
-#                 "Formato de imagem não suportado",
-#                 f"Use um dos formatos: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}",
-#             ),
-#         )
-#     if file.content_type and not file.content_type.startswith("image/"):
-#         raise HTTPException(
-#             status_code=400,
-#             detail=_error_detail(
-#                 ERROR_CODE_INVALID_FILE,
-#                 "Arquivo inválido",
-#                 "O arquivo não parece ser uma imagem.",
-#             ),
-#         )
-
-
-# async def read_image_bytes(file: UploadFile) -> bytes:
-#     try:
-#         content = await file.read()
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=_error_detail(
-#                 ERROR_CODE_INVALID_FILE,
-#                 "Erro ao ler o arquivo",
-#                 str(e),
-#             ),
-#         ) from e
-#     if not content:
-#         raise HTTPException(
-#             status_code=400,
-#             detail=_error_detail(
-#                 ERROR_CODE_INVALID_FILE,
-#                 "Arquivo vazio",
-#                 "O arquivo enviado está vazio.",
-#             ),
-#         )
-#     return content
-
-
-# def _load_image_correct_orientation(image_bytes: bytes) -> np.ndarray:
-#     """Carrega a imagem e aplica correção de orientação EXIF (comum em fotos de celular)."""
-#     img = Image.open(io.BytesIO(image_bytes))
-#     img = ImageOps.exif_transpose(img)  # corrige rotação de fotos de celular
-#     if img.mode != "RGB":
-#         img = img.convert("RGB")
-#     return np.array(img)
-
-
-# def load_image_and_detect_face(image_bytes: bytes):
-#     """Retorna (encoding, None, None) em sucesso ou (None, mensagem, codigo) em erro."""
-#     import face_recognition
-#     try:
-#         img_np = _load_image_correct_orientation(image_bytes)
-#     except Exception as e:
-#         return None, f"Imagem inválida ou corrompida: {str(e)}", ERROR_CODE_INVALID_IMAGE
-
-#     face_locations = face_recognition.face_locations(
-#         img_np, model="hog", number_of_times_to_upsample=2
-#     )
-#     if not face_locations:
-#         return (
-#             None,
-#             "Nenhum rosto detectado na imagem. Envie uma foto com o rosto visível, de frente e bem iluminado.",
-#             ERROR_CODE_NO_FACE,
-#         )
-#     if len(face_locations) > 1:
-#         def area(box):
-#             top, right, bottom, left = box
-#             return (bottom - top) * (right - left)
-#         face_locations = [max(face_locations, key=area)]
-
-#     encodings = face_recognition.face_encodings(img_np, known_face_locations=face_locations)
-#     if not encodings:
-#         return None, "Não foi possível gerar o encoding do rosto.", ERROR_CODE_ENCODING_FAILED
-#     return encodings[0], None, None
-
-
-# class GenerateEmbeddingResponse(BaseModel):
-#     embedding: list[float]
-#     modelVersion: str
-#     embeddingSize: int
-
-
-# def _embedding_error_message(code: str) -> str:
-#     """Mensagens curtas para o endpoint /generate-embedding."""
-#     if code == ERROR_CODE_NO_FACE:
-#         return "Nenhum rosto detectado na imagem"
-#     if code == ERROR_CODE_ENCODING_FAILED:
-#         return "Não foi possível gerar o embedding"
-#     if code == ERROR_CODE_INVALID_IMAGE:
-#         return "Imagem inválida ou corrompida"
-#     return "Erro ao processar a imagem"
-
-
-# @app.post("/generate-embedding", response_model=GenerateEmbeddingResponse)
-# async def generate_embedding(
-#     file: UploadFile = File(..., description="Imagem do rosto para gerar embedding"),
-# ):
-#     """
-#     Gera o embedding facial da imagem sem persistir nada.
-#     Usado antes do cadastro definitivo; o backend principal decide quando persistir biometria.
-#     """
-#     validate_image_upload(file)
-#     image_bytes = await read_image_bytes(file)
-
-#     get_face_lib()
-#     encoding, error_msg, error_code = load_image_and_detect_face(image_bytes)
-#     if error_msg is not None:
-#         raise HTTPException(
-#             status_code=400,
-#             detail={
-#                 "code": error_code,
-#                 "message": _embedding_error_message(error_code),
-#                 "detail": error_msg,
-#             },
-#         )
-
-#     embedding_list = encoding.tolist()
-#     return GenerateEmbeddingResponse(
-#         embedding=embedding_list,
-#         modelVersion="hog",
-#         embeddingSize=len(embedding_list),
-#     )
-
-
-# @app.get("/health")
-# async def health():
-#     return {"status": "ok"}
-
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

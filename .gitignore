@@ -1,0 +1,42 @@
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Ferramentas / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Env e segredos
+.env
+.env.*
+!.env.example
+
+# Banco / dados locais
+*.db
+*.sqlite3
+
+# Modelos / cache InsightFace
+.insightface/
+*.onnx
+
+# Logs
+*.log

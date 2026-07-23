@@ -3,47 +3,48 @@
 ## Primeira vez (instalação)
 
 ```bash
-# Entrar na pasta do projeto
-cd /Users/leorodrigues/projects/ppgo-goiaspen-app-back-cursor
+cd /Users/leorodrigues/projects/ppgo-biometria
 
-# Criar ambiente virtual
 python3 -m venv venv
-
-# Ativar o ambiente virtual
 source venv/bin/activate   # macOS/Linux
 # venv\Scripts\activate    # Windows
 
-# Instalar dependências (macOS Apple Silicon – sem compilar dlib)
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org dlib-bin
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org face_recognition --no-deps
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org Pillow face-recognition-models
-pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org "fastapi>=0.109.0" "uvicorn[standard]>=0.27.0" "python-multipart>=0.0.6" "numpy>=1.24.0" "setuptools>=70,<75"
+pip install -r requirements.txt
 ```
 
-Se não tiver erro de SSL, use apenas: `pip install dlib-bin` (e assim por diante, sem `--trusted-host`).
-
-Para outros sistemas ou uso de `requirements.txt`, veja **INSTALL.md**.
+Detalhes e variáveis de ambiente: veja **INSTALL.md**.
 
 ---
 
 ## Rodar o servidor
 
 ```bash
-# Ativar o ambiente virtual (se ainda não estiver ativo)
-source venv/bin/activate   # macOS/Linux
-# venv\Scripts\activate    # Windows
+source venv/bin/activate
 
-# Subir a API
+# Opcional em produção:
+# export BIOMETRIA_API_KEY="sua-chave"
+# export CORS_ORIGINS="https://seu-backend"
+
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-A API ficará disponível em:
+A API fica disponível em:
 
-- **Local:** http://localhost:8000  
-- **Documentação:** http://localhost:8000/docs  
-- **Health:** http://localhost:8000/health  
+- **Local:** http://localhost:8000
+- **Documentação:** http://localhost:8000/docs
+- **Health:** http://localhost:8000/health
 
-Para o app no celular/emulador acessar, use o IP do seu computador na rede (ex.: `http://192.168.1.x:8000`).
+Na primeira subida o modelo InsightFace é carregado no startup (`modelReady: true` no health).
+
+Para o app no celular/emulador acessar, use o IP do computador na rede (ex.: `http://192.168.1.x:8000`).
+
+### Exemplo com API key
+
+```bash
+curl -X POST http://localhost:8000/generate-embedding \
+  -H "X-API-Key: sua-chave" \
+  -F "file=@rosto.jpg"
+```
 
 ---
 
