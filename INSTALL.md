@@ -36,19 +36,27 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
-| `BIOMETRIA_API_KEY` | (vazio) | Se definido, exige header `X-API-Key` |
+| `BIOMETRIA_API_KEY` | (vazio) | Se definido, exige também o header `X-API-Key` |
+| `REQUIRE_SSO` | `true` | Se `true`, exige token SSO válido (`Authorization: Bearer` ou header `token`) |
+| `SSO_BASE_URL` | `https://ssows.ssp.go.gov.br/` | Base do SSO para `/validate?token=` (homologação: `https://ssows-h.ssp.go.gov.br/`) |
+| `SSO_TOKEN_CACHE_TTL` | `30` | Segundos de cache de token já validado |
 | `CORS_ORIGINS` | `*` | Origins permitidos, separados por vírgula |
 | `MAX_UPLOAD_BYTES` | `8388608` (8 MB) | Tamanho máximo do upload |
 | `MIN_FACE_CONFIDENCE` | `0.70` | Confiança mínima da detecção |
 | `MIN_FACE_AREA_RATIO` | `0.05` | Área mínima do rosto vs imagem (5%) |
 
-**Produção:** defina `BIOMETRIA_API_KEY` e `CORS_ORIGINS` com os origins do backend/app.
-
-Exemplo:
+**Produção:** deixe `REQUIRE_SSO=true` (padrão) e aponte `SSO_BASE_URL` para o SSO de produção. O app já envia o token do login. `/health` continua público.
 
 ```bash
-export BIOMETRIA_API_KEY="sua-chave-secreta"
+export REQUIRE_SSO=true
+export SSO_BASE_URL="https://ssows.ssp.go.gov.br/"
 export CORS_ORIGINS="https://api.exemplo.gov.br,https://app.exemplo.gov.br"
+```
+
+Para testar a API **sem** SSO na máquina local:
+
+```bash
+export REQUIRE_SSO=false
 ```
 
 ---

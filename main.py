@@ -5,15 +5,21 @@ O backend principal decide quando persistir biometria.
 """
 
 import asyncio
+import hashlib
 import io
+import json
 import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageOps
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -25,10 +31,13 @@ from insightface.app import FaceAnalysis
 # ==============================
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MB
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))  # 12 MB
 MIN_FACE_CONFIDENCE = float(os.getenv("MIN_FACE_CONFIDENCE", "0.70"))
 MIN_FACE_AREA_RATIO = float(os.getenv("MIN_FACE_AREA_RATIO", "0.05"))  # 5% da imagem
 API_KEY = os.getenv("BIOMETRIA_API_KEY", "").strip()
+SSO_BASE_URL = os.getenv("SSO_BASE_URL", "https://ssows.ssp.go.gov.br/").rstrip("/") + "/"
+SSO_VALIDATE_TIMEOUT = float(os.getenv("SSO_VALIDATE_TIMEOUT", "8"))
+SSO_TOKEN_CACHE_TTL = float(os.getenv("SSO_TOKEN_CACHE_TTL", "30"))
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ORIGINS", "").split(",")
@@ -45,9 +54,33 @@ ERROR_CODE_UNAUTHORIZED = "UNAUTHORIZED"
 ERROR_CODE_MODEL_NOT_READY = "MODEL_NOT_READY"
 ERROR_CODE_TOO_DARK = "TOO_DARK"
 ERROR_CODE_TOO_BRIGHT = "TOO_BRIGHT"
+ERROR_CODE_TOO_BLURRY = "TOO_BLURRY"
+ERROR_CODE_WRONG_POSE = "WRONG_POSE"
+ERROR_CODE_INVALID_POSE = "INVALID_POSE"
 
 MIN_BRIGHTNESS = float(os.getenv("MIN_BRIGHTNESS", "45"))   # 0–255
 MAX_BRIGHTNESS = float(os.getenv("MAX_BRIGHTNESS", "220"))  # 0–255
+MIN_BLUR_VARIANCE = float(os.getenv("MIN_BLUR_VARIANCE", "35"))
+BLUR_EVAL_MAX_SIDE = int(os.getenv("BLUR_EVAL_MAX_SIDE", "640"))
+MIN_FACE_WIDTH_RATIO = float(os.getenv("MIN_FACE_WIDTH_RATIO", "0.15"))
+MIN_FACE_WIDTH_RATIO_PROFILE = float(os.getenv("MIN_FACE_WIDTH_RATIO_PROFILE", "0.12"))
+MIN_FACE_CONFIDENCE_PROFILE = float(os.getenv("MIN_FACE_CONFIDENCE_PROFILE", "0.55"))
+YAW_FRONT_MAX = float(os.getenv("YAW_FRONT_MAX", "20"))       # |yaw| <= isto = frente
+YAW_PROFILE_MIN = float(os.getenv("YAW_PROFILE_MIN", "30"))   # |yaw| >= isto = perfil
+
+POSE_FRONT = "front"
+POSE_LEFT = "left_profile"
+POSE_RIGHT = "right_profile"
+POSE_ALIASES = {
+    "front": POSE_FRONT,
+    "frente": POSE_FRONT,
+    "left": POSE_LEFT,
+    "left_profile": POSE_LEFT,
+    "perfil_esquerdo": POSE_LEFT,
+    "right": POSE_RIGHT,
+    "right_profile": POSE_RIGHT,
+    "perfil_direito": POSE_RIGHT,
+}
 
 MODEL_NAME = "ArcFace"
 MODEL_VERSION = "buffalo_l"
@@ -101,7 +134,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="API Reconhecimento Facial",
     description="Geração de embeddings faciais 512d com InsightFace (ArcFace)",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -118,6 +151,71 @@ app.add_middleware(
 # Auth
 # ==============================
 
+_sso_token_cache: dict[str, float] = {}
+
+
+def sso_required() -> bool:
+    return os.getenv("REQUIRE_SSO", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def extract_request_token(authorization: Optional[str], token_header: Optional[str]) -> str:
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            return value.strip()
+    return (token_header or "").strip()
+
+
+def _token_cache_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def call_sso_validate(raw_token: str) -> bool:
+    """Consulta o SSO (mesmo /validate do app). True só com JSON de usuário."""
+    url = f"{SSO_BASE_URL}validate?token={urllib.parse.quote(raw_token)}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=SSO_VALIDATE_TIMEOUT) as response:
+            if int(getattr(response, "status", 200)) != 200:
+                return False
+            content_type = str(response.headers.get("Content-Type") or "")
+            if "json" not in content_type.lower():
+                return False
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    servidor = payload.get("servidor")
+    if isinstance(servidor, dict) and (servidor.get("cpf") or servidor.get("nome")):
+        return True
+    return bool(payload.get("cpf") or payload.get("nome"))
+
+
+def sso_token_is_valid(raw_token: str) -> bool:
+    key = _token_cache_key(raw_token)
+    now = time.monotonic()
+    expires = _sso_token_cache.get(key)
+    if expires is not None and expires > now:
+        return True
+    if not call_sso_validate(raw_token):
+        _sso_token_cache.pop(key, None)
+        return False
+    _sso_token_cache[key] = now + SSO_TOKEN_CACHE_TTL
+    return True
+
+
+def raise_unauthorized() -> None:
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "code": ERROR_CODE_UNAUTHORIZED,
+            "message": "Acesso não autorizado. Token inválido ou ausente.",
+            "detail": "Faça login novamente para continuar.",
+        },
+    )
+
+
 async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     if not API_KEY:
         return
@@ -130,6 +228,21 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
                 "detail": "Informe um X-API-Key válido.",
             },
         )
+
+
+async def require_sso_token(
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Header(default=None),
+) -> None:
+    """Exige token SSO válido (Authorization Bearer ou header token)."""
+    if not sso_required():
+        return
+    raw = extract_request_token(authorization, token)
+    if not raw:
+        raise_unauthorized()
+    ok = await asyncio.to_thread(sso_token_is_valid, raw)
+    if not ok:
+        raise_unauthorized()
 
 
 # ==============================
@@ -228,6 +341,101 @@ def face_area_ratio(face, image_shape: tuple[int, ...]) -> float:
     return face_area / image_area
 
 
+def face_width_ratio(face, image_shape: tuple[int, ...]) -> float:
+    bbox = getattr(face, "bbox", None)
+    if bbox is None or len(bbox) < 4:
+        return 1.0
+    x1, x2 = float(bbox[0]), float(bbox[2])
+    img_w = float(image_shape[1])
+    if img_w <= 0:
+        return 1.0
+    return abs(x2 - x1) / img_w
+
+
+def crop_face_region(img_np: np.ndarray, bbox, pad_ratio: float = 0.25) -> np.ndarray:
+    """Recorte do rosto com margem; cai para a imagem inteira se o bbox for inválido."""
+    if bbox is None or len(bbox) < 4:
+        return img_np
+    h, w = img_np.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    x1 = max(0, int(x1 - bw * pad_ratio))
+    y1 = max(0, int(y1 - bh * pad_ratio))
+    x2 = min(w, int(x2 + bw * pad_ratio))
+    y2 = min(h, int(y2 + bh * pad_ratio))
+    if x2 - x1 < 3 or y2 - y1 < 3:
+        return img_np
+    return img_np[y1:y2, x1:x2]
+
+
+def _resize_for_blur(img_np: np.ndarray) -> np.ndarray:
+    """Normaliza resolução: Laplaciano 3x3 em foto 12MP subestima nitidez (pixels vizinhos iguais)."""
+    h, w = img_np.shape[:2]
+    max_side = max(h, w)
+    if max_side <= BLUR_EVAL_MAX_SIDE or max_side < 3:
+        return img_np
+    scale = BLUR_EVAL_MAX_SIDE / float(max_side)
+    new_w = max(3, int(round(w * scale)))
+    new_h = max(3, int(round(h * scale)))
+    return np.array(Image.fromarray(img_np).resize((new_w, new_h), Image.BILINEAR))
+
+
+def blur_variance(img_np: np.ndarray) -> float:
+    """Variância do Laplaciano (nitidez), em tamanho canônico. Valores baixos = borrado."""
+    sample = _resize_for_blur(img_np)
+    gray = (
+        0.299 * sample[:, :, 0].astype(np.float64)
+        + 0.587 * sample[:, :, 1].astype(np.float64)
+        + 0.114 * sample[:, :, 2].astype(np.float64)
+    )
+    if gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 0.0
+    lap = (
+        -4.0 * gray[1:-1, 1:-1]
+        + gray[1:-1, :-2]
+        + gray[1:-1, 2:]
+        + gray[:-2, 1:-1]
+        + gray[2:, 1:-1]
+    )
+    return float(np.var(lap))
+
+
+def estimate_yaw_degrees(face) -> Optional[float]:
+    """
+    Yaw aproximado via landmarks 5 pontos (olho esq, olho dir, nariz, ...).
+    Positivo: nariz à direita do meio dos olhos (rosto virado para a esquerda do sujeito).
+    """
+    kps = getattr(face, "kps", None)
+    if kps is None:
+        return None
+    pts = np.asarray(kps, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+        return None
+    left_eye, right_eye, nose = pts[0], pts[1], pts[2]
+    interocular = abs(float(right_eye[0] - left_eye[0]))
+    if interocular < 1e-3:
+        return None
+    eye_mid_x = (float(left_eye[0]) + float(right_eye[0])) / 2.0
+    offset = (float(nose[0]) - eye_mid_x) / interocular
+    return float(np.clip(offset, -1.5, 1.5) * 60.0)
+
+
+def normalize_pose(pose: str) -> str:
+    key = (pose or "").strip().lower()
+    normalized = POSE_ALIASES.get(key)
+    if not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": ERROR_CODE_INVALID_POSE,
+                "message": "Pose inválida",
+                "detail": "Use pose=front|left_profile|right_profile (ou left|right).",
+            },
+        )
+    return normalized
+
+
 def mean_brightness(img_np: np.ndarray) -> float:
     """Luminância média aproximada (0–255) em RGB."""
     # ITU-R BT.601
@@ -266,6 +474,126 @@ def assert_illumination_ok(img_np: np.ndarray) -> float:
     return brightness
 
 
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0 or a.shape != b.shape:
+        return 0.0
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.clip(np.dot(a, b) / denom, -1.0, 1.0))
+
+
+def collect_pose_errors(expected_pose: str, yaw: Optional[float]) -> list[str]:
+    if yaw is None:
+        return [ERROR_CODE_WRONG_POSE]
+    if expected_pose == POSE_FRONT:
+        if abs(yaw) > YAW_FRONT_MAX:
+            return [ERROR_CODE_WRONG_POSE]
+    elif expected_pose == POSE_LEFT:
+        if yaw > -YAW_PROFILE_MIN:
+            return [ERROR_CODE_WRONG_POSE]
+    elif expected_pose == POSE_RIGHT:
+        if yaw < YAW_PROFILE_MIN:
+            return [ERROR_CODE_WRONG_POSE]
+    return []
+
+
+class InspectedFace(BaseModel):
+    embedding: list[float]
+    yaw: Optional[float] = None
+    brightness: float
+    blur: float
+    face_count: int
+    face_width_ratio: Optional[float] = None
+    face_confidence: Optional[float] = None
+    pose: str
+    errors: list[str]
+
+
+def inspect_face_image(img_np: np.ndarray, expected_pose: str) -> InspectedFace:
+    brightness = mean_brightness(img_np)
+    errors: list[str] = []
+
+    if brightness < MIN_BRIGHTNESS:
+        errors.append(ERROR_CODE_TOO_DARK)
+    elif brightness > MAX_BRIGHTNESS:
+        errors.append(ERROR_CODE_TOO_BRIGHT)
+
+    analysis = get_face_app()
+    faces = analysis.get(img_np)
+    face_count = len(faces) if faces else 0
+    yaw: Optional[float] = None
+    width_ratio: Optional[float] = None
+    confidence: Optional[float] = None
+    embedding: list[float] = []
+    blur = 0.0
+
+    if face_count == 0:
+        errors.append(ERROR_CODE_NO_FACE)
+        blur = blur_variance(img_np)
+    elif face_count > 1:
+        errors.append(ERROR_CODE_MULTIPLE_FACES)
+        blur = blur_variance(img_np)
+    else:
+        face = faces[0]
+        blur = blur_variance(crop_face_region(img_np, getattr(face, "bbox", None)))
+        if blur < MIN_BLUR_VARIANCE:
+            errors.append(ERROR_CODE_TOO_BLURRY)
+        confidence = float(face.det_score)
+        width_ratio = face_width_ratio(face, img_np.shape)
+        yaw = estimate_yaw_degrees(face)
+        min_conf = MIN_FACE_CONFIDENCE if expected_pose == POSE_FRONT else MIN_FACE_CONFIDENCE_PROFILE
+        min_width = MIN_FACE_WIDTH_RATIO if expected_pose == POSE_FRONT else MIN_FACE_WIDTH_RATIO_PROFILE
+        if confidence < min_conf:
+            errors.append(ERROR_CODE_LOW_FACE_CONFIDENCE)
+        if width_ratio < min_width:
+            errors.append(ERROR_CODE_FACE_TOO_SMALL)
+        errors.extend(collect_pose_errors(expected_pose, yaw))
+        if not errors:
+            embedding = l2_normalize(np.asarray(face.embedding, dtype=np.float64)).tolist()
+
+    deduped: list[str] = []
+    for code in errors:
+        if code not in deduped:
+            deduped.append(code)
+
+    return InspectedFace(
+        embedding=embedding,
+        yaw=yaw,
+        brightness=round(brightness, 2),
+        blur=round(blur, 2),
+        face_count=face_count,
+        face_width_ratio=round(width_ratio, 4) if width_ratio is not None else None,
+        face_confidence=round(confidence, 4) if confidence is not None else None,
+        pose=expected_pose,
+        errors=deduped,
+    )
+
+
+async def inspect_upload(file: UploadFile, expected_pose: str) -> InspectedFace:
+    validate_image_upload(file)
+    image_bytes = await read_image_bytes(file)
+    img_np = load_image(image_bytes)
+    return await asyncio.to_thread(inspect_face_image, img_np, expected_pose)
+
+
+def raise_inspect_error(step: str, inspected: InspectedFace) -> None:
+    if not inspected.errors:
+        return
+    code = inspected.errors[0]
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": code,
+            "message": f"Falha na captura ({step})",
+            "detail": f"Etapa {step}: {', '.join(inspected.errors)}",
+            "step": step,
+            "errors": inspected.errors,
+            "metrics": inspected.model_dump(exclude={"embedding"}),
+        },
+    )
+
+
 # ==============================
 # Response Model
 # ==============================
@@ -285,6 +613,22 @@ class ValidatePhotoQualityResponse(BaseModel):
     maxBrightness: float
 
 
+class DetaineePhotoMetrics(BaseModel):
+    face_count: int
+    yaw: Optional[float] = None
+    brightness: float
+    blur: float
+    face_width_ratio: Optional[float] = None
+    face_confidence: Optional[float] = None
+    pose: str
+
+
+class ValidateDetaineePhotoResponse(BaseModel):
+    valid: bool
+    errors: list[str]
+    metrics: DetaineePhotoMetrics
+
+
 # ==============================
 # Endpoint principal
 # ==============================
@@ -292,7 +636,7 @@ class ValidatePhotoQualityResponse(BaseModel):
 @app.post(
     "/generate-embedding",
     response_model=GenerateEmbeddingResponse,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_sso_token)],
 )
 async def generate_embedding(
     file: UploadFile = File(..., description="Imagem do rosto para gerar embedding"),
@@ -369,12 +713,12 @@ async def generate_embedding(
 @app.post(
     "/validate-photo-quality",
     response_model=ValidatePhotoQualityResponse,
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(require_sso_token)],
 )
 async def validate_photo_quality(
     file: UploadFile = File(..., description="Imagem para validar iluminação (sem exigir rosto)"),
 ):
-    """Valida só iluminação — útil para fotos de perfil onde a face pode não ser detectada."""
+    """Valida só iluminação — legado; preferir /validate-detainee-photo para fotos de busto."""
     validate_image_upload(file)
     image_bytes = await read_image_bytes(file)
     img_np = load_image(image_bytes)
@@ -384,6 +728,109 @@ async def validate_photo_quality(
         brightness=brightness,
         minBrightness=MIN_BRIGHTNESS,
         maxBrightness=MAX_BRIGHTNESS,
+    )
+
+
+@app.post(
+    "/validate-detainee-photo",
+    response_model=ValidateDetaineePhotoResponse,
+    dependencies=[Depends(require_api_key), Depends(require_sso_token)],
+)
+async def validate_detainee_photo(
+    file: UploadFile = File(..., description="Foto de identificação (frente ou perfil)"),
+    pose: str = Query(
+        ...,
+        description="Pose esperada: front | left_profile | right_profile (aliases: left, right)",
+    ),
+):
+    """
+    Valida foto de identificação sem gerar embedding:
+    iluminação, nitidez, 1 rosto, tamanho mínimo e orientação (yaw) conforme a pose.
+    """
+    expected_pose = normalize_pose(pose)
+    validate_image_upload(file)
+    image_bytes = await read_image_bytes(file)
+    img_np = load_image(image_bytes)
+
+    brightness = mean_brightness(img_np)
+    errors: list[str] = []
+
+    if brightness < MIN_BRIGHTNESS:
+        errors.append(ERROR_CODE_TOO_DARK)
+    elif brightness > MAX_BRIGHTNESS:
+        errors.append(ERROR_CODE_TOO_BRIGHT)
+
+    analysis = get_face_app()
+    faces = await asyncio.to_thread(analysis.get, img_np)
+    face_count = len(faces) if faces else 0
+
+    yaw: Optional[float] = None
+    width_ratio: Optional[float] = None
+    confidence: Optional[float] = None
+    blur = 0.0
+
+    if face_count == 0:
+        errors.append(ERROR_CODE_NO_FACE)
+        blur = blur_variance(img_np)
+    elif face_count > 1:
+        errors.append(ERROR_CODE_MULTIPLE_FACES)
+        blur = blur_variance(img_np)
+    else:
+        face = faces[0]
+        blur = blur_variance(crop_face_region(img_np, getattr(face, "bbox", None)))
+        if blur < MIN_BLUR_VARIANCE:
+            errors.append(ERROR_CODE_TOO_BLURRY)
+        confidence = float(face.det_score)
+        width_ratio = face_width_ratio(face, img_np.shape)
+        yaw = estimate_yaw_degrees(face)
+
+        min_conf = (
+            MIN_FACE_CONFIDENCE
+            if expected_pose == POSE_FRONT
+            else MIN_FACE_CONFIDENCE_PROFILE
+        )
+        min_width = (
+            MIN_FACE_WIDTH_RATIO
+            if expected_pose == POSE_FRONT
+            else MIN_FACE_WIDTH_RATIO_PROFILE
+        )
+
+        if confidence < min_conf:
+            errors.append(ERROR_CODE_LOW_FACE_CONFIDENCE)
+        if width_ratio < min_width:
+            errors.append(ERROR_CODE_FACE_TOO_SMALL)
+
+        if yaw is None:
+            errors.append(ERROR_CODE_WRONG_POSE)
+        elif expected_pose == POSE_FRONT:
+            if abs(yaw) > YAW_FRONT_MAX:
+                errors.append(ERROR_CODE_WRONG_POSE)
+        elif expected_pose == POSE_LEFT:
+            # Perfil esquerdo: yaw negativo (nariz à esquerda na imagem)
+            if yaw > -YAW_PROFILE_MIN:
+                errors.append(ERROR_CODE_WRONG_POSE)
+        elif expected_pose == POSE_RIGHT:
+            if yaw < YAW_PROFILE_MIN:
+                errors.append(ERROR_CODE_WRONG_POSE)
+
+    # remove duplicatas preservando ordem
+    deduped: list[str] = []
+    for code in errors:
+        if code not in deduped:
+            deduped.append(code)
+
+    return ValidateDetaineePhotoResponse(
+        valid=len(deduped) == 0,
+        errors=deduped,
+        metrics=DetaineePhotoMetrics(
+            face_count=face_count,
+            yaw=yaw,
+            brightness=round(brightness, 2),
+            blur=round(blur, 2),
+            face_width_ratio=round(width_ratio, 4) if width_ratio is not None else None,
+            face_confidence=round(confidence, 4) if confidence is not None else None,
+            pose=expected_pose,
+        ),
     )
 
 
