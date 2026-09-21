@@ -1,0 +1,89 @@
+variables:
+  ORG: dgap
+  APP_NAME: ppgoapibiometriafacialws
+  IMAGE_TAG: $CI_REGISTRY/$ORG/$APP_NAME:$CI_COMMIT_SHORT_SHA
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+
+stages:
+  - python
+  - docker
+  - homo
+  - prod
+
+python:
+  image: python:3.12-slim
+  stage: python
+  script:
+    - python --version
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+
+docker:
+  image: docker:27
+  stage: docker
+  services:
+    - name: docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  script:
+    - |
+      for i in $(seq 1 30); do
+        if docker info >/dev/null 2>&1; then
+          echo "Docker daemon is ready"
+          break
+        fi
+        echo "Waiting for Docker daemon... ($i/30)"
+        sleep 2
+      done
+      docker info
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $IMAGE_TAG .
+    - docker push $IMAGE_TAG
+  only:
+    - branches
+    - merge_requests
+  except:
+    - tags
+
+homo:
+  image: dtzar/helm-kubectl
+  environment:
+    name: homologacao
+  stage: homo
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+    - when: manual
+  script:
+    - export KUBE_CONFIG="$KUBE_CONFIG_HOMO"
+    - export QTD_REPLICAS=1
+    - export QTD_MEMORIA=2Gi
+    - deploy
+
+prod:
+  image: dtzar/helm-kubectl
+  environment:
+    name: producao
+  stage: prod
+  when: manual
+  only:
+    - main
+    - master
+  script:
+    - export KUBE_CONFIG="$KUBE_CONFIG_PROD"
+    - export QTD_REPLICAS=1
+    - export QTD_MEMORIA=2Gi
+    - deploy
+
+.functions: &functions |
+
+  function deploy() {
+    mkdir ~/.kube && echo "$KUBE_CONFIG" > ~/.kube/config
+    sed -e "s/{{COMMIT_ID}}/$CI_COMMIT_SHORT_SHA/g" -e "s/{{JOB_ID}}/$CI_JOB_ID/g" -e "s/{{QTD_REPLICAS}}/$QTD_REPLICAS/g" ./kube/all.yaml | kubectl apply -f -
+    kubectl rollout status deployment.v1.apps/${APP_NAME}-deployment || (kubectl describe pod -l jobid=$CI_JOB_ID && kubectl logs --tail=10000 -l jobid=$CI_JOB_ID && exit 1)
+  }
+
+before_script:
+  - *functions

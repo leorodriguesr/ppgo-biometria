@@ -1,0 +1,90 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ppgoapibiometriafacialws-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0" # Keeps unlimited upload size for images
+    # rewrite-target removed to prevent stripping API endpoints (e.g. /v1/match)
+spec:
+  ingressClassName: nginx # Moved to correct location
+  tls:
+    - hosts:
+        - ppgobiometriafacialapi.ssp.go.gov.br
+      secretName: certificado-ssp
+  rules:
+      - host: ppgobiometriafacialapi.ssp.go.gov.br
+        http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: ppgoapibiometriafacialws-service
+                  port:
+                    number: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ppgoapibiometriafacialws-service
+spec:
+  selector:
+    app: ppgoapibiometriafacialws-pod
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ppgoapibiometriafacialws-deployment
+spec:
+  replicas: {{QTD_REPLICAS}}
+  selector:
+    matchLabels:
+      app: ppgoapibiometriafacialws-pod
+  template:
+    metadata:
+      labels:
+        app: ppgoapibiometriafacialws-pod
+        jobid: "{{JOB_ID}}"
+    spec:
+        imagePullSecrets:
+        - name: docker-registry-ssp
+        containers:
+        - name: ppgoapibiometriafacialws
+          image: docker.ssp.go.gov.br/dgap/ppgoapibiometriafacialws:{{COMMIT_ID}}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: config-global
+          env:
+            - name: FLASK_CONFIG
+              value: "production"
+            - name: API_INTERNAL_PORT
+              value: "8080"
+          # 1. Added Resource Limits (Adjust values based on actual model size/needs)
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          # 2. Added Probes (Ensure your API has a lightweight /health endpoint)
+          readinessProbe:
+            httpGet:
+              path: /health  # Update this to your app's actual health route
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
