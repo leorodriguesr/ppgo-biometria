@@ -60,6 +60,7 @@ homo:
     - export KUBE_CONFIG="$KUBE_CONFIG_HOMO"
     - export QTD_REPLICAS=1
     - export QTD_MEMORIA=2Gi
+    - export APP_HOST="ppgobiometriafacialapi-homo.ssp.go.gov.br"
     - deploy
 
 prod:
@@ -75,13 +76,14 @@ prod:
     - export KUBE_CONFIG="$KUBE_CONFIG_PROD"
     - export QTD_REPLICAS=1
     - export QTD_MEMORIA=2Gi
+    - export APP_HOST="ppgobiometriafacialapi.ssp.go.gov.br"
     - deploy
 
 .functions: &functions |
 
   function deploy() {
     mkdir ~/.kube && echo "$KUBE_CONFIG" > ~/.kube/config
-    sed -e "s/{{COMMIT_ID}}/$CI_COMMIT_SHORT_SHA/g" -e "s/{{JOB_ID}}/$CI_JOB_ID/g" -e "s/{{QTD_REPLICAS}}/$QTD_REPLICAS/g" ./kube/all.yaml | kubectl apply -f -
+    sed -e "s/{{COMMIT_ID}}/$CI_COMMIT_SHORT_SHA/g" -e "s/{{JOB_ID}}/$CI_JOB_ID/g" -e "s/{{QTD_REPLICAS}}/$QTD_REPLICAS/g" -e "s/{{APP_HOST}}/$APP_HOST/g" ./kube/all.yaml | kubectl apply -f -
     kubectl rollout status deployment.v1.apps/${APP_NAME}-deployment || (kubectl describe pod -l jobid=$CI_JOB_ID && kubectl logs --tail=10000 -l jobid=$CI_JOB_ID && exit 1)
   }
 

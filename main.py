@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -19,8 +20,9 @@ from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageOps
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from insightface.app import FaceAnalysis
@@ -38,11 +40,22 @@ API_KEY = os.getenv("BIOMETRIA_API_KEY", "").strip()
 SSO_BASE_URL = os.getenv("SSO_BASE_URL", "https://ssows.ssp.go.gov.br/").rstrip("/") + "/"
 SSO_VALIDATE_TIMEOUT = float(os.getenv("SSO_VALIDATE_TIMEOUT", "8"))
 SSO_TOKEN_CACHE_TTL = float(os.getenv("SSO_TOKEN_CACHE_TTL", "30"))
-CORS_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "").split(",")
-    if origin.strip()
-]
+
+
+def parse_cors_origins(raw: Optional[str] = None) -> list[str]:
+    source = os.getenv("CORS_ORIGINS", "") if raw is None else raw
+    origins: list[str] = []
+    for origin in source.split(","):
+        value = origin.strip()
+        if not value:
+            continue
+        if value == "*":
+            raise RuntimeError(
+                "CORS_ORIGINS não aceita '*'. Informe origens explícitas "
+                "ou deixe vazio para desabilitar CORS."
+            )
+        origins.append(value.rstrip("/"))
+    return origins
 
 ERROR_CODE_NO_FACE = "NO_FACE_DETECTED"
 ERROR_CODE_MULTIPLE_FACES = "MULTIPLE_FACES"
@@ -51,6 +64,22 @@ ERROR_CODE_INVALID_FILE = "INVALID_FILE"
 ERROR_CODE_LOW_FACE_CONFIDENCE = "LOW_FACE_CONFIDENCE"
 ERROR_CODE_FACE_TOO_SMALL = "FACE_TOO_SMALL"
 ERROR_CODE_UNAUTHORIZED = "UNAUTHORIZED"
+ERROR_CODE_RATE_LIMITED = "RATE_LIMITED"
+
+RATE_LIMIT_WINDOW_SECONDS = float(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_IP = int(os.getenv("RATE_LIMIT_IP", "30"))
+RATE_LIMIT_TOKEN = int(os.getenv("RATE_LIMIT_TOKEN", "20"))
+AUTH_FAILURE_LIMIT = int(os.getenv("AUTH_FAILURE_LIMIT", "10"))
+AUTH_FAILURE_BLOCK_SECONDS = float(os.getenv("AUTH_FAILURE_BLOCK_SECONDS", "60"))
+RATE_LIMITED_PATHS = {
+    "/generate-embedding",
+    "/validate-photo-quality",
+    "/validate-detainee-photo",
+}
+_rate_hits: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+_auth_failures: dict[str, tuple[int, float]] = {}
+_auth_lock = threading.Lock()
 ERROR_CODE_MODEL_NOT_READY = "MODEL_NOT_READY"
 ERROR_CODE_TOO_DARK = "TOO_DARK"
 ERROR_CODE_TOO_BRIGHT = "TOO_BRIGHT"
@@ -131,20 +160,34 @@ async def lifespan(_app: FastAPI):
 # FastAPI Setup
 # ==============================
 
+def api_docs_enabled() -> bool:
+    return os.getenv("API_DOCS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_docs_enabled = api_docs_enabled()
 app = FastAPI(
     title="API Reconhecimento Facial",
     description="Geração de embeddings faciais 512d com InsightFace (ArcFace)",
     version="2.2.0",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def configure_cors(application: FastAPI, origins: list[str]) -> None:
+    if not origins:
+        return
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key", "token"],
+    )
+
+
+configure_cors(app, parse_cors_origins())
 
 
 # ==============================
@@ -168,6 +211,95 @@ def extract_request_token(authorization: Optional[str], token_header: Optional[s
 
 def _token_cache_key(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def client_ip(request: Request) -> str:
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def rate_limit_allows(key: str, limit: int, now: Optional[float] = None) -> bool:
+    if limit <= 0:
+        return True
+    current = time.monotonic() if now is None else now
+    with _rate_lock:
+        hits = [
+            stamp
+            for stamp in _rate_hits.get(key, [])
+            if current - stamp < RATE_LIMIT_WINDOW_SECONDS
+        ]
+        if len(hits) >= limit:
+            _rate_hits[key] = hits
+            return False
+        hits.append(current)
+        _rate_hits[key] = hits
+        return True
+
+
+def auth_block_remaining(ip: str, now: Optional[float] = None) -> int:
+    if not ip:
+        return 0
+    current = time.monotonic() if now is None else now
+    with _auth_lock:
+        _count, until = _auth_failures.get(ip, (0, 0.0))
+        if until > current:
+            return max(1, int(until - current))
+        return 0
+
+
+def register_auth_failure(ip: str, now: Optional[float] = None) -> None:
+    if AUTH_FAILURE_LIMIT <= 0 or not ip:
+        return
+    current = time.monotonic() if now is None else now
+    with _auth_lock:
+        count, until = _auth_failures.get(ip, (0, 0.0))
+        if until > current:
+            return
+        count += 1
+        if count % AUTH_FAILURE_LIMIT == 0:
+            step = count // AUTH_FAILURE_LIMIT
+            delay = min(AUTH_FAILURE_BLOCK_SECONDS * (2 ** (step - 1)), 900)
+            until = current + delay
+        _auth_failures[ip] = (count, until)
+
+
+def clear_auth_failures(ip: str) -> None:
+    if not ip:
+        return
+    with _auth_lock:
+        _auth_failures.pop(ip, None)
+
+
+def rate_limit_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": {
+                "code": ERROR_CODE_RATE_LIMITED,
+                "message": "Muitas requisições",
+                "detail": "Aguarde antes de tentar novamente.",
+            }
+        },
+        headers={"Retry-After": str(max(1, int(RATE_LIMIT_WINDOW_SECONDS)))},
+    )
+
+
+@app.middleware("http")
+async def limit_biometric_requests(request: Request, call_next):
+    if request.method == "POST" and request.url.path in RATE_LIMITED_PATHS:
+        if not rate_limit_allows(f"ip:{client_ip(request)}", RATE_LIMIT_IP):
+            return rate_limit_response()
+        raw = extract_request_token(
+            request.headers.get("authorization"),
+            request.headers.get("token"),
+        )
+        if raw and not rate_limit_allows(f"token:{_token_cache_key(raw)}", RATE_LIMIT_TOKEN):
+            return rate_limit_response()
+    return await call_next(request)
 
 
 def call_sso_validate(raw_token: str) -> bool:
@@ -230,19 +362,37 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
         )
 
 
-async def require_sso_token(
-    authorization: Optional[str] = Header(default=None),
-    token: Optional[str] = Header(default=None),
+async def enforce_sso_token(
+    authorization: Optional[str],
+    token_header: Optional[str],
+    ip: str = "",
 ) -> None:
-    """Exige token SSO válido (Authorization Bearer ou header token)."""
     if not sso_required():
         return
-    raw = extract_request_token(authorization, token)
-    if not raw:
+    remaining = auth_block_remaining(ip)
+    if remaining:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": ERROR_CODE_RATE_LIMITED,
+                "message": "Muitas tentativas de autenticação",
+                "detail": "Aguarde antes de tentar novamente.",
+            },
+            headers={"Retry-After": str(remaining)},
+        )
+    raw = extract_request_token(authorization, token_header)
+    if not raw or not await asyncio.to_thread(sso_token_is_valid, raw):
+        register_auth_failure(ip)
         raise_unauthorized()
-    ok = await asyncio.to_thread(sso_token_is_valid, raw)
-    if not ok:
-        raise_unauthorized()
+    clear_auth_failures(ip)
+
+
+async def require_sso_token(request: Request) -> None:
+    await enforce_sso_token(
+        request.headers.get("authorization"),
+        request.headers.get("token"),
+        client_ip(request),
+    )
 
 
 # ==============================
@@ -834,13 +984,42 @@ async def validate_detainee_photo(
     )
 
 
+def build_openapi() -> dict:
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {})
+    schemes = components.setdefault("securitySchemes", {})
+    schemes["BearerAuth"] = {"type": "http", "scheme": "bearer"}
+    schemes["TokenHeader"] = {"type": "apiKey", "in": "header", "name": "token"}
+    for path, methods in schema.get("paths", {}).items():
+        if path not in RATE_LIMITED_PATHS:
+            continue
+        for operation in methods.values():
+            if not isinstance(operation, dict):
+                continue
+            operation["security"] = [{"BearerAuth": []}, {"TokenHeader": []}]
+    return schema
+
+
+def custom_openapi() -> dict:
+    if app.openapi_schema:
+        return app.openapi_schema
+    app.openapi_schema = build_openapi()
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok" if model_ready else "starting",
-        "model": f"{MODEL_VERSION} ({EMBEDDING_SIZE}d)",
-        "modelReady": model_ready,
-    }
+    return {"status": "ok" if model_ready else "degraded"}
 
 
 if __name__ == "__main__":

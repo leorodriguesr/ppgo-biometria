@@ -40,7 +40,13 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 | `REQUIRE_SSO` | `true` | Se `true`, exige token SSO válido (`Authorization: Bearer` ou header `token`) |
 | `SSO_BASE_URL` | `https://ssows.ssp.go.gov.br/` | Base do SSO para `/validate?token=` (homologação: `https://ssows-h.ssp.go.gov.br/`) |
 | `SSO_TOKEN_CACHE_TTL` | `30` | Segundos de cache de token já validado |
-| `CORS_ORIGINS` | `*` | Origins permitidos, separados por vírgula |
+| `CORS_ORIGINS` | (vazio) | Origens permitidas, separadas por vírgula |
+| `RATE_LIMIT_IP` | `30` | Máximo de POST biométrico por IP na janela. `0` desliga |
+| `RATE_LIMIT_TOKEN` | `20` | Máximo de POST biométrico por token na janela. `0` desliga |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Duração da janela do rate limit |
+| `AUTH_FAILURE_LIMIT` | `10` | Falhas de autenticação antes do bloqueio. `0` desliga |
+| `AUTH_FAILURE_BLOCK_SECONDS` | `60` | Bloqueio inicial após falhas; dobra a cada ciclo, até 900s |
+| `API_DOCS_ENABLED` | `false` | Publica `/docs` e `/openapi.json` |
 | `MAX_UPLOAD_BYTES` | `8388608` (8 MB) | Tamanho máximo do upload |
 | `MIN_FACE_CONFIDENCE` | `0.70` | Confiança mínima da detecção |
 | `MIN_FACE_AREA_RATIO` | `0.05` | Área mínima do rosto vs imagem (5%) |
@@ -50,7 +56,6 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 ```bash
 export REQUIRE_SSO=true
 export SSO_BASE_URL="https://ssows.ssp.go.gov.br/"
-export CORS_ORIGINS="https://api.exemplo.gov.br,https://app.exemplo.gov.br"
 ```
 
 Para testar a API **sem** SSO na máquina local:

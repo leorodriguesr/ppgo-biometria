@@ -21,9 +21,8 @@ Detalhes e variáveis de ambiente: veja **INSTALL.md**.
 ```bash
 source venv/bin/activate
 
-# Opcional em produção:
 # export BIOMETRIA_API_KEY="sua-chave"
-# export CORS_ORIGINS="https://seu-backend"
+# export API_DOCS_ENABLED=true
 
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -31,10 +30,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 A API fica disponível em:
 
 - **Local:** http://localhost:8000
-- **Documentação:** http://localhost:8000/docs
+- **Documentação:** http://localhost:8000/docs com `API_DOCS_ENABLED=true`
 - **Health:** http://localhost:8000/health
-
-Na primeira subida o modelo InsightFace é carregado no startup (`modelReady: true` no health).
 
 Para o app no celular/emulador acessar, use o IP do computador na rede (ex.: `http://192.168.1.x:8000`).
 

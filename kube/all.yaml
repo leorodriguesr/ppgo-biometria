@@ -9,10 +9,10 @@ spec:
   ingressClassName: nginx # Moved to correct location
   tls:
     - hosts:
-        - ppgobiometriafacialapi.ssp.go.gov.br
+        - {{APP_HOST}}
       secretName: certificado-ssp
   rules:
-      - host: ppgobiometriafacialapi.ssp.go.gov.br
+      - host: {{APP_HOST}}
         http:
           paths:
             - path: /

@@ -144,10 +144,10 @@ class SsoAuthTests(unittest.TestCase):
 
     def test_missing_token_is_unauthorized(self):
         from fastapi import HTTPException
-        from main import require_sso_token
+        from main import enforce_sso_token
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(require_sso_token(None, None))
+            asyncio.run(enforce_sso_token(None, None))
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.detail["code"], "UNAUTHORIZED")
 
@@ -155,26 +155,26 @@ class SsoAuthTests(unittest.TestCase):
         from unittest.mock import patch
 
         from fastapi import HTTPException
-        from main import require_sso_token
+        from main import enforce_sso_token
 
         with patch("main.call_sso_validate", return_value=False):
             with self.assertRaises(HTTPException) as raised:
-                asyncio.run(require_sso_token("Bearer invalido", None))
+                asyncio.run(enforce_sso_token("Bearer invalido", None))
         self.assertEqual(raised.exception.status_code, 401)
 
     def test_valid_sso_token_passes(self):
         from unittest.mock import patch
 
-        from main import require_sso_token
+        from main import enforce_sso_token
 
         with patch("main.call_sso_validate", return_value=True):
-            asyncio.run(require_sso_token("Bearer valido", None))
+            asyncio.run(enforce_sso_token("Bearer valido", None))
 
     def test_can_disable_sso_for_local_dev(self):
-        from main import require_sso_token
+        from main import enforce_sso_token
 
         os.environ["REQUIRE_SSO"] = "false"
-        asyncio.run(require_sso_token(None, None))
+        asyncio.run(enforce_sso_token(None, None))
 
 
 if __name__ == "__main__":
