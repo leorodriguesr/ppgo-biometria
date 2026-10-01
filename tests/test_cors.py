@@ -16,11 +16,12 @@ class CorsConfigTests(unittest.TestCase):
         self.assertEqual(parse_cors_origins(""), [])
         self.assertEqual(parse_cors_origins(" , "), [])
 
-    def test_wildcard_is_rejected(self):
-        with self.assertRaises(RuntimeError):
-            parse_cors_origins("*")
-        with self.assertRaises(RuntimeError):
-            parse_cors_origins("https://app.exemplo.gov.br, *")
+    def test_wildcard_is_ignored(self):
+        self.assertEqual(parse_cors_origins("*"), [])
+        self.assertEqual(
+            parse_cors_origins("https://app.exemplo.gov.br, *"),
+            ["https://app.exemplo.gov.br"],
+        )
 
     def test_explicit_origins_are_normalized(self):
         self.assertEqual(

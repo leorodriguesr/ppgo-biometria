@@ -49,13 +49,9 @@ def parse_cors_origins(raw: Optional[str] = None) -> list[str]:
     origins: list[str] = []
     for origin in source.split(","):
         value = origin.strip()
-        if not value:
+        if not value or value == "*":
+            # ConfigMap global às vezes traz '*'; não derruba o processo.
             continue
-        if value == "*":
-            raise RuntimeError(
-                "CORS_ORIGINS não aceita '*'. Informe origens explícitas "
-                "ou deixe vazio para desabilitar CORS."
-            )
         origins.append(value.rstrip("/"))
     return origins
 
@@ -148,11 +144,22 @@ def get_face_app() -> FaceAnalysis:
     return face_app
 
 
+def _load_face_app_in_background() -> None:
+    global face_app, model_ready
+    try:
+        loaded = load_face_app()
+        face_app = loaded
+        model_ready = True
+    except Exception:
+        model_ready = False
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global face_app, model_ready
-    face_app = await asyncio.to_thread(load_face_app)
-    model_ready = True
+    model_ready = False
+    loader = threading.Thread(target=_load_face_app_in_background, daemon=True)
+    loader.start()
     yield
     model_ready = False
     face_app = None

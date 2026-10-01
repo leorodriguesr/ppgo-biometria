@@ -39,7 +39,7 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 | `BIOMETRIA_API_KEY` | (vazio) | Se definido, exige também o header `X-API-Key` |
 | `REQUIRE_SSO` | `true` | Se `true`, exige token SSO válido (`Authorization: Bearer` ou header `token`) |
 | `SSO_TOKEN_CACHE_TTL` | `30` | Segundos de cache de token já validado |
-| `CORS_ORIGINS` | (vazio) | Origens permitidas, separadas por vírgula |
+| `CORS_ORIGINS` | (vazio) | Origens permitidas, separadas por vírgula. `*` é ignorado |
 | `RATE_LIMIT_IP` | `30` | Máximo de POST biométrico por IP na janela. `0` desliga |
 | `RATE_LIMIT_TOKEN` | `20` | Máximo de POST biométrico por token na janela. `0` desliga |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Duração da janela do rate limit |
