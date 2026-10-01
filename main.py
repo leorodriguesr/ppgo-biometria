@@ -37,7 +37,9 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))  # 
 MIN_FACE_CONFIDENCE = float(os.getenv("MIN_FACE_CONFIDENCE", "0.70"))
 MIN_FACE_AREA_RATIO = float(os.getenv("MIN_FACE_AREA_RATIO", "0.05"))  # 5% da imagem
 API_KEY = os.getenv("BIOMETRIA_API_KEY", "").strip()
-SSO_BASE_URL = os.getenv("SSO_BASE_URL", "https://ssows.ssp.go.gov.br/").rstrip("/") + "/"
+SSO_PROD_BASE_URL = "https://ssows.ssp.go.gov.br/"
+SSO_HOMO_BASE_URL = "https://ssows-h.ssp.go.gov.br/"
+SSO_VALIDATE_URLS = (SSO_PROD_BASE_URL, SSO_HOMO_BASE_URL)
 SSO_VALIDATE_TIMEOUT = float(os.getenv("SSO_VALIDATE_TIMEOUT", "8"))
 SSO_TOKEN_CACHE_TTL = float(os.getenv("SSO_TOKEN_CACHE_TTL", "30"))
 
@@ -302,9 +304,8 @@ async def limit_biometric_requests(request: Request, call_next):
     return await call_next(request)
 
 
-def call_sso_validate(raw_token: str) -> bool:
-    """Consulta o SSO (mesmo /validate do app). True só com JSON de usuário."""
-    url = f"{SSO_BASE_URL}validate?token={urllib.parse.quote(raw_token)}"
+def _validate_against_sso(base_url: str, raw_token: str) -> bool:
+    url = f"{base_url}validate?token={urllib.parse.quote(raw_token, safe='-._~')}"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=SSO_VALIDATE_TIMEOUT) as response:
@@ -322,6 +323,14 @@ def call_sso_validate(raw_token: str) -> bool:
     if isinstance(servidor, dict) and (servidor.get("cpf") or servidor.get("nome")):
         return True
     return bool(payload.get("cpf") or payload.get("nome"))
+
+
+def call_sso_validate(raw_token: str) -> bool:
+    """Aceita token válido no SSO de produção ou no de homologação."""
+    for base in SSO_VALIDATE_URLS:
+        if _validate_against_sso(base, raw_token):
+            return True
+    return False
 
 
 def sso_token_is_valid(raw_token: str) -> bool:

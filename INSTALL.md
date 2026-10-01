@@ -38,7 +38,6 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 |----------|--------|-----------|
 | `BIOMETRIA_API_KEY` | (vazio) | Se definido, exige também o header `X-API-Key` |
 | `REQUIRE_SSO` | `true` | Se `true`, exige token SSO válido (`Authorization: Bearer` ou header `token`) |
-| `SSO_BASE_URL` | `https://ssows.ssp.go.gov.br/` | Base do SSO para `/validate?token=` (homologação: `https://ssows-h.ssp.go.gov.br/`) |
 | `SSO_TOKEN_CACHE_TTL` | `30` | Segundos de cache de token já validado |
 | `CORS_ORIGINS` | (vazio) | Origens permitidas, separadas por vírgula |
 | `RATE_LIMIT_IP` | `30` | Máximo de POST biométrico por IP na janela. `0` desliga |
@@ -51,11 +50,10 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r req
 | `MIN_FACE_CONFIDENCE` | `0.70` | Confiança mínima da detecção |
 | `MIN_FACE_AREA_RATIO` | `0.05` | Área mínima do rosto vs imagem (5%) |
 
-**Produção:** deixe `REQUIRE_SSO=true` (padrão) e aponte `SSO_BASE_URL` para o SSO de produção. O app já envia o token do login. `/health` continua público.
+SSO é sempre o token do login (`Authorization: Bearer`). A API tenta o SSO de produção e, se não aceitar, o de homologação. Não precisa de variável no Kubernetes.
 
 ```bash
 export REQUIRE_SSO=true
-export SSO_BASE_URL="https://ssows.ssp.go.gov.br/"
 ```
 
 Para testar a API **sem** SSO na máquina local:

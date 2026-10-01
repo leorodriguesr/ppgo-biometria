@@ -170,6 +170,17 @@ class SsoAuthTests(unittest.TestCase):
         with patch("main.call_sso_validate", return_value=True):
             asyncio.run(enforce_sso_token("Bearer valido", None))
 
+    def test_accepts_token_valid_on_homolog_sso(self):
+        from unittest.mock import patch
+
+        from main import SSO_HOMO_BASE_URL, call_sso_validate
+
+        def side_effect(base_url: str, _token: str) -> bool:
+            return base_url.rstrip("/") == SSO_HOMO_BASE_URL.rstrip("/")
+
+        with patch("main._validate_against_sso", side_effect=side_effect):
+            self.assertTrue(call_sso_validate("token-homo"))
+
     def test_can_disable_sso_for_local_dev(self):
         from main import enforce_sso_token
 
