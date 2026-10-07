@@ -9,6 +9,8 @@ import hashlib
 import io
 import json
 import os
+import queue
+import sys
 import threading
 import time
 import urllib.error
@@ -120,35 +122,121 @@ EMBEDDING_SIZE = 512
 
 face_app: Optional[FaceAnalysis] = None
 model_ready = False
+_face_pool: queue.Queue[FaceAnalysis] = queue.Queue()
+_embedding_pool: queue.Queue[FaceAnalysis] = queue.Queue()
+_embedding_ready = False
+_embedding_lock = threading.Lock()
+EMBEDDING_ONLY_MODULES = ["detection", "recognition"]
 
 
-def load_face_app() -> FaceAnalysis:
-    app_instance = FaceAnalysis(
-        name=MODEL_VERSION,
-        providers=["CPUExecutionProvider"],  # Trocar para CUDAExecutionProvider se tiver GPU
-    )
-    app_instance.prepare(ctx_id=0, det_size=(640, 640))
+def carga_only_mode() -> bool:
+    """Modo local dedicado à carga; mantém o servidor normal inalterado por padrão."""
+    return os.getenv("CARGA_ONLY_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def face_worker_count() -> int:
+    raw = os.getenv("FACE_WORKERS", "").strip()
+    if raw.isdigit():
+        return max(1, min(int(raw), 8))
+    # No Mac local, 4 núcleos rápidos e 2 lentos. No container segue uma só.
+    if sys.platform == "darwin":
+        return 6
+    return 1
+
+
+def load_face_app(allowed_modules: Optional[list[str]] = None) -> FaceAnalysis:
+    count = face_worker_count()
+    threads = 1 if count >= 6 else 2 if count > 1 else 0
+    from insightface.model_zoo.model_zoo import PickableInferenceSession
+
+    original_init = PickableInferenceSession.__init__
+
+    def init_with_threads(self, model_path, **kwargs):
+        if threads > 0 and "sess_options" not in kwargs:
+            import onnxruntime
+
+            options = onnxruntime.SessionOptions()
+            options.intra_op_num_threads = threads
+            options.inter_op_num_threads = 1
+            kwargs["sess_options"] = options
+        original_init(self, model_path, **kwargs)
+
+    PickableInferenceSession.__init__ = init_with_threads
+    try:
+        app_instance = FaceAnalysis(
+            name=MODEL_VERSION,
+            allowed_modules=allowed_modules,
+            providers=["CPUExecutionProvider"],
+        )
+        app_instance.prepare(ctx_id=0, det_size=(640, 640))
+    finally:
+        PickableInferenceSession.__init__ = original_init
     return app_instance
 
 
-def get_face_app() -> FaceAnalysis:
-    if face_app is None or not model_ready:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": ERROR_CODE_MODEL_NOT_READY,
-                "message": "Modelo não pronto",
-                "detail": "O modelo de reconhecimento facial ainda está carregando.",
-            },
-        )
-    return face_app
+def _model_not_ready() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": ERROR_CODE_MODEL_NOT_READY,
+            "message": "Modelo não pronto",
+            "detail": "O modelo de reconhecimento facial ainda está carregando.",
+        },
+    )
+
+
+def ensure_embedding_pool() -> None:
+    """Cópias só com detecção e reconhecimento, usadas pela carga em lote."""
+    global _embedding_ready
+    if _embedding_ready:
+        return
+    with _embedding_lock:
+        if _embedding_ready:
+            return
+        loaded = [load_face_app(EMBEDDING_ONLY_MODULES) for _ in range(face_worker_count())]
+        for app_instance in loaded:
+            _embedding_pool.put(app_instance)
+        _embedding_ready = True
+
+
+class _BorrowedFaceApp:
+    def __init__(self, embedding_only: bool = False) -> None:
+        self._embedding_only = embedding_only
+        self._pool = _face_pool
+        self._app: Optional[FaceAnalysis] = None
+
+    def __enter__(self) -> FaceAnalysis:
+        if self._embedding_only or carga_only_mode():
+            ensure_embedding_pool()
+            self._pool = _embedding_pool
+        elif not model_ready:
+            raise _model_not_ready()
+        self._app = self._pool.get()
+        return self._app
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._app is not None:
+            self._pool.put(self._app)
+
+
+def borrow_face_app(embedding_only: bool = False) -> _BorrowedFaceApp:
+    return _BorrowedFaceApp(embedding_only)
 
 
 def _load_face_app_in_background() -> None:
     global face_app, model_ready
     try:
-        loaded = load_face_app()
-        face_app = loaded
+        if carga_only_mode():
+            ensure_embedding_pool()
+            face_app = _embedding_pool.queue[0]
+            model_ready = True
+            return
+        loaded: list[FaceAnalysis] = []
+        for _ in range(face_worker_count()):
+            loaded.append(load_face_app())
+        for app_instance in loaded:
+            _face_pool.put(app_instance)
+        face_app = loaded[0]
         model_ready = True
     except Exception:
         model_ready = False
@@ -685,8 +773,8 @@ def inspect_face_image(img_np: np.ndarray, expected_pose: str) -> InspectedFace:
     elif brightness > MAX_BRIGHTNESS:
         errors.append(ERROR_CODE_TOO_BRIGHT)
 
-    analysis = get_face_app()
-    faces = analysis.get(img_np)
+    with borrow_face_app() as analysis:
+        faces = analysis.get(img_np)
     face_count = len(faces) if faces else 0
     yaw: Optional[float] = None
     width_ratio: Optional[float] = None
@@ -806,14 +894,19 @@ class ValidateDetaineePhotoResponse(BaseModel):
 )
 async def generate_embedding(
     file: UploadFile = File(..., description="Imagem do rosto para gerar embedding"),
+    x_embedding_only: Optional[str] = Header(default=None),
 ):
     validate_image_upload(file)
     image_bytes = await read_image_bytes(file)
     img_np = load_image(image_bytes)
     assert_illumination_ok(img_np)
+    embedding_only = (x_embedding_only or "").strip().lower() in {"1", "true", "yes", "on"}
 
-    analysis = get_face_app()
-    faces = await asyncio.to_thread(analysis.get, img_np)
+    def detect_faces() -> list:
+        with borrow_face_app(embedding_only) as analysis:
+            return analysis.get(img_np)
+
+    faces = await asyncio.to_thread(detect_faces)
 
     if not faces:
         raise HTTPException(
@@ -926,8 +1019,11 @@ async def validate_detainee_photo(
     elif brightness > MAX_BRIGHTNESS:
         errors.append(ERROR_CODE_TOO_BRIGHT)
 
-    analysis = get_face_app()
-    faces = await asyncio.to_thread(analysis.get, img_np)
+    def detect_faces() -> list:
+        with borrow_face_app() as analysis:
+            return analysis.get(img_np)
+
+    faces = await asyncio.to_thread(detect_faces)
     face_count = len(faces) if faces else 0
 
     yaw: Optional[float] = None
