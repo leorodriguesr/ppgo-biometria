@@ -31,9 +31,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY . .
 
 # Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser \
+# UID fixo e USER numerico: o kubelet so valida runAsNonRoot com UID numerico,
+# e o runAsUser do all.yaml precisa ser o mesmo UID (HOME = /home/appuser).
+RUN useradd --uid 1000 --create-home --shell /bin/bash appuser \
     && chown -R appuser:appuser /app
-USER appuser
+USER 1000:1000
 
 # Expose port (documentation only - actual mapping in docker-compose)
 EXPOSE ${API_INTERNAL_PORT}

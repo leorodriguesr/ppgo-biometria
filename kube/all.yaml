@@ -1,90 +1,179 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
+
 metadata:
   name: ppgoapibiometriafacialws-ingress
+
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "0" # Keeps unlimited upload size for images
-    # rewrite-target removed to prevent stripping API endpoints (e.g. /v1/match)
+    # Upload de imagens sem limite de tamanho. Sem rewrite-target para nao
+    # cortar os endpoints da API (ex.: /v1/match).
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+
 spec:
-  ingressClassName: nginx # Moved to correct location
+  ingressClassName: nginx
+
   tls:
     - hosts:
         - {{APP_HOST}}
+
       secretName: certificado-ssp
+
   rules:
-      - host: {{APP_HOST}}
-        http:
-          paths:
-            - path: /
-              pathType: Prefix
-              backend:
-                service:
-                  name: ppgoapibiometriafacialws-service
-                  port:
-                    number: 80
+    - host: {{APP_HOST}}
+
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+
+            backend:
+              service:
+                name: ppgoapibiometriafacialws-service
+
+                port:
+                  number: 80
+
 ---
 apiVersion: v1
 kind: Service
+
 metadata:
   name: ppgoapibiometriafacialws-service
+
 spec:
+  type: ClusterIP
+
   selector:
     app: ppgoapibiometriafacialws-pod
-  type: ClusterIP
+
   ports:
     - name: http
+      protocol: TCP
+
+      # Porta interna do Service.
       port: 80
+
+      # Nome da porta definida no container.
       targetPort: http
+
 ---
 apiVersion: apps/v1
 kind: Deployment
+
 metadata:
   name: ppgoapibiometriafacialws-deployment
+
 spec:
   replicas: {{QTD_REPLICAS}}
+
+  revisionHistoryLimit: 5
+
+  progressDeadlineSeconds: 600
+
+  strategy:
+    type: RollingUpdate
+
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
   selector:
     matchLabels:
       app: ppgoapibiometriafacialws-pod
+
   template:
     metadata:
       labels:
         app: ppgoapibiometriafacialws-pod
         jobid: "{{JOB_ID}}"
+
     spec:
-        imagePullSecrets:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+      imagePullSecrets:
         - name: docker-registry-ssp
-        containers:
+
+      terminationGracePeriodSeconds: 30
+
+      containers:
         - name: ppgoapibiometriafacialws
+
           image: docker.ssp.go.gov.br/dgap/ppgoapibiometriafacialws:{{COMMIT_ID}}
-          ports:
-            - name: http
-              containerPort: 8080
-          envFrom:
-            - configMapRef:
-                name: config-global
+
+          imagePullPolicy: IfNotPresent
+
+          # UID 1000 = appuser do Dockerfile. Precisa bater: o modelo do InsightFace
+          # e baixado em ~/.insightface (/home/appuser) na subida.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+
+            limits:
+              cpu: "{{QTD_CPU}}"
+              memory: "{{QTD_MEMORIA}}"
+
           env:
             - name: FLASK_CONFIG
               value: "production"
+
             - name: API_INTERNAL_PORT
               value: "8080"
-          # 1. Added Resource Limits (Adjust values based on actual model size/needs)
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "512Mi"
-            limits:
-              cpu: "1000m"
-              memory: "1Gi"
-          # 2. Added Probes (Ensure your API has a lightweight /health endpoint)
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: config-global
+
+          # Segura liveness/readiness ate a API responder pela primeira vez
+          # (import do insightface/onnxruntime e lento). Ate 5 min.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTP
+
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 30
+
           readinessProbe:
             httpGet:
-              path: /health  # Update this to your app's actual health route
+              path: /health
               port: http
-            initialDelaySeconds: 5
+              scheme: HTTP
+
+            initialDelaySeconds: 0
             periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 15
+              scheme: HTTP
+
+            initialDelaySeconds: 0
             periodSeconds: 20
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3

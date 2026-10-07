@@ -60,6 +60,7 @@ homo:
     - export KUBE_CONFIG="$KUBE_CONFIG_HOMO"
     - export QTD_REPLICAS=1
     - export QTD_MEMORIA=2Gi
+    - export QTD_CPU=1
     - export APP_HOST="ppgobiometriafacialapi-homo.ssp.go.gov.br"
     - deploy
 
@@ -75,16 +76,51 @@ prod:
   script:
     - export KUBE_CONFIG="$KUBE_CONFIG_PROD"
     - export QTD_REPLICAS=1
-    - export QTD_MEMORIA=2Gi
+    - export QTD_MEMORIA=4Gi
+    - export QTD_CPU=2
     - export APP_HOST="ppgobiometriafacialapi.ssp.go.gov.br"
     - deploy
 
 .functions: &functions |
 
   function deploy() {
-    mkdir ~/.kube && echo "$KUBE_CONFIG" > ~/.kube/config
-    sed -e "s/{{COMMIT_ID}}/$CI_COMMIT_SHORT_SHA/g" -e "s/{{JOB_ID}}/$CI_JOB_ID/g" -e "s/{{QTD_REPLICAS}}/$QTD_REPLICAS/g" -e "s/{{APP_HOST}}/$APP_HOST/g" ./kube/all.yaml | kubectl apply -f -
-    kubectl rollout status deployment.v1.apps/${APP_NAME}-deployment || (kubectl describe pod -l jobid=$CI_JOB_ID && kubectl logs --tail=10000 -l jobid=$CI_JOB_ID && exit 1)
+    mkdir -p ~/.kube
+
+    printf '%s' "$KUBE_CONFIG" > ~/.kube/config
+    chmod 600 ~/.kube/config
+
+    sed -e "s/{{COMMIT_ID}}/$CI_COMMIT_SHORT_SHA/g" \
+        -e "s/{{JOB_ID}}/$CI_JOB_ID/g" \
+        -e "s/{{QTD_REPLICAS}}/$QTD_REPLICAS/g" \
+        -e "s/{{QTD_MEMORIA}}/$QTD_MEMORIA/g" \
+        -e "s/{{QTD_CPU}}/$QTD_CPU/g" \
+        -e "s/{{APP_HOST}}/$APP_HOST/g" \
+        ./kube/all.yaml > all-temp.yaml
+
+    echo "Manifesto Kubernetes que será aplicado:"
+    cat all-temp.yaml
+
+    if grep -q "{{" all-temp.yaml; then
+      echo "ERRO: existem variáveis que não foram substituídas."
+      exit 1
+    fi
+
+    kubectl apply -f all-temp.yaml
+
+    kubectl rollout status \
+      deployment/${APP_NAME}-deployment \
+      --timeout=10m || (
+        echo "Falha no rollout. Exibindo detalhes do Deployment e dos Pods."
+
+        kubectl describe deployment/${APP_NAME}-deployment || true
+        kubectl describe pod -l jobid="$CI_JOB_ID" || true
+        kubectl logs \
+          --tail=10000 \
+          --all-containers=true \
+          -l jobid="$CI_JOB_ID" || true
+
+        exit 1
+      )
   }
 
 before_script:
